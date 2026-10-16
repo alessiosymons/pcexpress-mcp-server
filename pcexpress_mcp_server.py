@@ -29,7 +29,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from pcid_token import TokenManager
+from pcid_token import PcidAuthError, TokenManager
 
 # Load .env if present (no-op when the launcher passes env directly)
 load_dotenv()
@@ -37,6 +37,96 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pcexpress-mcp")
+
+
+def _price(prices: dict | None) -> dict | None:
+    """Current price, was-price and unit price, without the API's nesting."""
+    if not prices:
+        return None
+    out = {
+        "price": (prices.get("price") or {}).get("value"),
+        "unit": (prices.get("price") or {}).get("unit"),
+    }
+    if prices.get("wasPrice"):
+        out["wasPrice"] = prices["wasPrice"].get("value")
+    comparison = prices.get("comparisonPrices") or []
+    if comparison:
+        c = comparison[0]
+        out["comparison"] = f"${c.get('value')}/{c.get('quantity')}{c.get('unit')}"
+    return out
+
+
+def _units(units: dict | None) -> dict | None:
+    """What cart `quantity` means for this product (grams for SOLD_BY_WEIGHT)."""
+    if not units:
+        return None
+    return {
+        "type": units.get("type"),
+        "unit": units.get("unit"),
+        "min": units.get("minOrderQuantity"),
+        "max": units.get("maxOrderQuantity"),
+        "interval": units.get("interval"),
+    }
+
+
+def _value(v):
+    return v.get("value") if isinstance(v, dict) else v
+
+
+def _summarize_order(order_id: str, order: dict) -> dict:
+    """Order lines with codes and what was paid; drops PII and the ~1 MB of noise."""
+    details = order.get("orderDetails") or {}
+    items = []
+    for entry in details.get("entries") or []:
+        product = entry.get("product") or {}
+        items.append(
+            {
+                "code": product.get("id"),
+                "name": product.get("productName"),
+                "brand": product.get("brand"),
+                "quantity": entry.get("quantity"),
+                "weight": entry.get("weight"),
+                "unitPrice": _value(entry.get("unitPrice")),
+                "paid": _value(entry.get("totalPrice")),
+            }
+        )
+    return {
+        "orderId": order_id,
+        "created": order.get("created"),
+        "status": order.get("statusDisplay"),
+        # Matches the placed/fulfilled time; the 48 h ad-match window runs from delivery.
+        "fulfilled": (details.get("booking") or {}).get("pickupStartDate"),
+        "postalCode": (details.get("shippingAddress") or {}).get("postalCode"),
+        "items": items,
+    }
+
+
+def _summarize_cart(cart: dict) -> dict:
+    """Cart lines and totals only; the raw cart is ~100 KB of JSON."""
+    lines = []
+    for order in cart.get("orders") or []:
+        for entry in order.get("entries") or []:
+            product = entry.get("offer", {}).get("product") or entry.get("product") or {}
+            lines.append(
+                {
+                    "code": product.get("code") or entry.get("code"),
+                    "name": product.get("name"),
+                    "brand": product.get("brand"),
+                    "packageSize": product.get("packageSize"),
+                    "quantity": entry.get("quantity"),
+                    "unit": entry.get("uom") or entry.get("unit"),
+                    "price": _price(entry.get("offer", {}).get("prices") or entry.get("prices")),
+                    "lineTotal": (entry.get("totalPrice") or {}).get("value")
+                    if isinstance(entry.get("totalPrice"), dict)
+                    else entry.get("totalPrice"),
+                }
+            )
+    totals = {
+        k: (v.get("value") if isinstance(v, dict) else v)
+        for k, v in (cart.get("orderSummary") or cart.get("totals") or {}).items()
+        if not isinstance(v, (list,))
+    }
+    return {"cartId": cart.get("id"), "itemCount": len(lines), "items": lines, "totals": totals}
 
 
 class PCExpressAPI:
@@ -259,9 +349,13 @@ class PCExpressAPI:
             "term": query,
             "storeId": self.store_id,
             "banner": self.banner,
-            "cartId": self.cart_id,
             "pagination": {"from": 0, "size": size},
         }
+        # Search works without a cart; only send one if the account has it.
+        try:
+            payload["cartId"] = self.cart_id
+        except ValueError:
+            pass
 
         data = self._request("POST", url, json=payload).json()
 
@@ -273,11 +367,12 @@ class PCExpressAPI:
                     "name": item.get("name"),
                     "brand": item.get("brand"),
                     "packageSize": item.get("packageSize"),
-                    "prices": item.get("prices"),
-                    "dealPrice": item.get("dealPrice"),
+                    "price": _price(item.get("prices")),
+                    "deal": (item.get("dealPrice") or {}).get("text")
+                    if isinstance(item.get("dealPrice"), dict)
+                    else item.get("dealPrice"),
                     "stockStatus": item.get("stockStatus"),
-                    "link": item.get("link"),
-                    "offerType": item.get("offerType"),
+                    "pricingUnits": _units(item.get("pricingUnits")),
                 }
             )
 
@@ -363,8 +458,8 @@ def get_api_client() -> PCExpressAPI:
     if api_client is None:
         # cart_id is optional — auto-discovered from the customer profile when omitted.
         cart_id = os.getenv("PCEXPRESS_CART_ID")
-        store_id = os.getenv("PCEXPRESS_STORE_ID", "1234")
-        banner = os.getenv("PCEXPRESS_BANNER", "zehrs")
+        store_id = os.getenv("PCEXPRESS_STORE_ID", "2800")
+        banner = os.getenv("PCEXPRESS_BANNER", "superstore")
 
         # TokenManager mints/refreshes access tokens from the stored refresh token.
         token_manager = TokenManager()
@@ -377,6 +472,15 @@ def get_api_client() -> PCExpressAPI:
 async def list_tools() -> list[Tool]:
     """List available MCP tools"""
     return [
+        Tool(
+            name="login",
+            description=(
+                "Sign in to PC Express. Opens a Chrome window on the PC id login page; the "
+                "user types their own credentials there. Use when another tool reports that "
+                "login is needed. Waits up to 5 minutes."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
         Tool(
             name="search_past_orders",
             description=(
@@ -416,9 +520,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_products",
             description=(
-                "Search for products by name or keyword. "
-                "Returns full product details including product codes, names, brands, prices, and descriptions. "
-                "Use this to find products the user wants to add to cart."
+                "Search for products by name or keyword at the configured store. "
+                "Returns product codes, names, brands, sizes, prices, deals, stock and pricingUnits. "
+                "pricingUnits.type says what add_to_cart quantity means for that product."
             ),
             inputSchema={
                 "type": "object",
@@ -429,8 +533,8 @@ async def list_tools() -> list[Tool]:
                     },
                     "limit": {
                         "type": "number",
-                        "description": "Maximum number of results (default: 48)",
-                        "default": 48,
+                        "description": "Maximum number of results (default: 10)",
+                        "default": 10,
                     },
                 },
                 "required": ["query"],
@@ -457,8 +561,11 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="add_to_cart",
             description=(
-                "Add a product to the shopping cart or update its quantity. "
-                "Requires the product code from search results or past orders."
+                "Set a product's quantity in the cart (this replaces the quantity, it does not add to it). "
+                "Quantity depends on the product's pricingUnits.type from search: SOLD_BY_EACH = "
+                "number of packages; SOLD_BY_EACH_PRICED_BY_WEIGHT = number of pieces (e.g. 6 apples); "
+                "SOLD_BY_WEIGHT = grams (500 = 0.5 kg). Stay within pricingUnits min/max. "
+                "Returns the updated cart summary."
             ),
             inputSchema={
                 "type": "object",
@@ -469,7 +576,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "quantity": {
                         "type": "number",
-                        "description": "Quantity to set (default: 1)",
+                        "description": "Quantity to set; units per pricingUnits.type (default: 1)",
                         "default": 1,
                     },
                     "fulfillment_method": {
@@ -507,7 +614,18 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     """Handle tool calls"""
+    global api_client
     try:
+        if name == "login":
+            import asyncio
+
+            import login_pcid
+
+            tokens = await asyncio.to_thread(login_pcid.login_browser)
+            path = login_pcid.save_tokens(tokens)
+            api_client = None  # pick up the new token
+            return [TextContent(type="text", text=f"Logged in. Token saved to {path}.")]
+
         client = get_api_client()
 
         if name == "search_past_orders":
@@ -533,13 +651,13 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
         elif name == "get_order_items":
             order_id = arguments["order_id"]
-            result = client.get_order_details(order_id)
+            result = _summarize_order(order_id, client.get_order_details(order_id))
 
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         elif name == "search_products":
             query = arguments["query"]
-            limit = arguments.get("limit", 48)
+            limit = arguments.get("limit", 10)
             result = client.search_products(query, size=limit)
 
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -555,24 +673,26 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             quantity = arguments.get("quantity", 1)
             fulfillment = arguments.get("fulfillment_method", "pickup")
 
-            result = client.add_to_cart(product_code, quantity, fulfillment)
+            result = _summarize_cart(client.add_to_cart(product_code, quantity, fulfillment))
 
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         elif name == "remove_from_cart":
             product_code = arguments["product_code"]
-            result = client.remove_from_cart(product_code)
+            result = _summarize_cart(client.remove_from_cart(product_code))
 
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         elif name == "view_cart":
-            result = client.get_cart()
+            result = _summarize_cart(client.get_cart())
 
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
+    except PcidAuthError as e:
+        return [TextContent(type="text", text=f"Not logged in ({e}). Call the login tool.")]
     except Exception as e:
         logger.error(f"Error in {name}: {str(e)}", exc_info=True)
         return [TextContent(type="text", text=f"Error: {str(e)}")]

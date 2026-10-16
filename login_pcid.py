@@ -111,19 +111,68 @@ def login_manual() -> dict:
     return exchange_code(code, verifier)
 
 
+def save_tokens(tokens: dict) -> str:
+    """Seed the server's state file so the token never goes in an env var or config."""
+    import json
+    import os
+    import time
+
+    state_dir = os.getenv("PCEXPRESS_STATE_DIR", os.path.expanduser("~/.pcexpress-mcp"))
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    path = os.path.join(state_dir, "pcid_token_state.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(
+            {
+                "refresh_token": tokens["refresh_token"],
+                "access_token": tokens.get("access_token"),
+                "expires_at": time.time() + int(tokens.get("expires_in", 3600)),
+            },
+            f,
+        )
+    return path
+
+
+def login_browser(timeout_s: int = 300) -> dict:
+    """Open real Chrome on the PC id page; the user signs in, we catch the redirect.
+
+    Credentials are typed into the PC id page by the user and never seen here.
+    """
+    from playwright.sync_api import sync_playwright
+
+    verifier = _b64url(secrets.token_bytes(64))
+    challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
+    state = _b64url(secrets.token_bytes(24))
+    nonce = _b64url(secrets.token_bytes(16))
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            channel="chrome",
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            page = browser.new_context().new_page()
+            page.goto(build_authorize_url(challenge, state, nonce))
+            # PC id ends on .../login/success?redirectURL=com.loblaw.pcx://...?code=...
+            page.wait_for_url("**/login/success**", timeout=timeout_s * 1000)
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(page.url).query)
+            inner = urllib.parse.unquote(q.get("redirectURL", [page.url])[0])
+        finally:
+            browser.close()
+    return exchange_code(extract_code(inner, state), verifier)
+
+
 def main():
-    tokens = login_manual()
+    tokens = login_manual() if "--manual" in sys.argv else login_browser()
     refresh = tokens.get("refresh_token")
     if not refresh:
         raise SystemExit(
             f"No refresh_token in response (scope missing offline_access?): {list(tokens)}"
         )
-    print("\n=== Success. Set these on the MCP server: ===\n")
-    print(f"PCEXPRESS_CLIENT_SECRET={cfg.CLIENT_SECRET}")
-    print(f"PCEXPRESS_REFRESH_TOKEN={refresh}")
-    print(
-        f"\n(access token expires in {tokens.get('expires_in')}s; the server refreshes automatically)"
-    )
+    path = save_tokens(tokens)
+    print(f"\n=== Success. Saved tokens to {path} (chmod 600). ===")
+    print("The server refreshes automatically; no env var needed.")
 
 
 if __name__ == "__main__":
